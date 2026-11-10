@@ -7,6 +7,7 @@ import os
 import sys
 import time
 import json
+import struct
 import argparse
 import subprocess
 import dbus
@@ -23,32 +24,38 @@ USER_SERVICE_PATH = os.path.join(USER_SYSTEMD_DIR, SERVICE_NAME)
 DEFAULT_CONFIG = {
     "device_mac": "",
     "device_name": "",
-    "distance_profile": "near",
-    "rssi_lock_threshold": -58,
-    "rssi_unlock_threshold": -52,
-    "away_timeout": 4.0,
+    "distance_profile": "very_near",
+    "rssi_lock_threshold": -62,
+    "rssi_unlock_threshold": -55,
+    "away_timeout": 3.5,
     "required_near_hits": 2,
     "required_away_hits": 3,
     "manual_lock_requires_password": True
 }
 
 PROFILES = {
+    "very_near": {
+        "name": "Очень близко (~1-1.5 м, сразу при отходе от стола)",
+        "lock": -62,
+        "unlock": -55,
+        "timeout": 3.0
+    },
     "near": {
-        "name": "Близко (У стола, ~1-1.5 м)",
-        "lock": -58,
-        "unlock": -52,
+        "name": "Близко (~2-2.5 м, зона рабочего кабинета)",
+        "lock": -68,
+        "unlock": -60,
         "timeout": 4.0
     },
     "medium": {
-        "name": "Средне (В пределах комнаты, ~2.5-3.5 м)",
-        "lock": -68,
-        "unlock": -60,
+        "name": "Средне (~3.5-5 м, в пределах комнаты)",
+        "lock": -76,
+        "unlock": -68,
         "timeout": 5.0
     },
     "far": {
-        "name": "Далеко (Выход из кабинета, ~5-7 м)",
-        "lock": -78,
-        "unlock": -70,
+        "name": "Далеко (~7-10 м, при выходе в другую комнату)",
+        "lock": -84,
+        "unlock": -76,
         "timeout": 6.0
     }
 }
@@ -176,7 +183,7 @@ class ProximityDaemon:
         self.last_seen_time = time.time()
         self.last_ble_rssi = None
         self.last_bt_rssi = None
-        self.last_link_quality = None
+        self.smooth_rssi = None
         self.last_connected = False
         self.probe_in_progress = False
         self.last_probe_time = 0.0
@@ -236,23 +243,37 @@ class ProximityDaemon:
                 self.last_ble_rssi = int(changed_props["RSSI"])
                 self.last_seen_time = time.time()
 
-    def get_bt_stats(self):
-        """Чтение Link Quality и RSSI для активного Bluetooth Classic соединения"""
-        rssi = None
-        lq = None
+    def get_hardware_rssi(self):
+        """Чтение реального аппаратного RSSI активного соединения (LE или Classic) через HCI"""
         try:
-            r = subprocess.run(["hcitool", "rssi", self.device_mac], capture_output=True, text=True, timeout=0.6)
-            if r.returncode == 0 and "RSSI return value:" in r.stdout:
-                rssi = int(r.stdout.strip().split()[-1])
+            out = subprocess.check_output(["hcitool", "con"], text=True, stderr=subprocess.DEVNULL)
+            handle = None
+            for line in out.splitlines():
+                if self.device_mac.upper() in line.upper() and "handle" in line:
+                    parts = line.split()
+                    if "handle" in parts:
+                        idx = parts.index("handle")
+                        handle = int(parts[idx + 1])
+                        break
+            if handle is None:
+                return None
+
+            h_low = f"0x{handle & 0xff:02x}"
+            h_high = f"0x{(handle >> 8) & 0xff:02x}"
+
+            cmd_out = subprocess.check_output(
+                ["hcitool", "cmd", "0x05", "0x0005", h_low, h_high],
+                text=True, stderr=subprocess.DEVNULL
+            )
+            lines = cmd_out.strip().splitlines()
+            for i, l in enumerate(lines):
+                if "> HCI Event:" in l and i + 1 < len(lines):
+                    bytes_list = lines[i + 1].strip().split()
+                    if len(bytes_list) >= 7 and bytes_list[3] == "00":
+                        return struct.unpack("b", bytes.fromhex(bytes_list[6]))[0]
         except Exception:
-            pass
-        try:
-            r = subprocess.run(["hcitool", "lq", self.device_mac], capture_output=True, text=True, timeout=0.6)
-            if r.returncode == 0 and "Link quality:" in r.stdout:
-                lq = int(r.stdout.strip().split()[-1])
-        except Exception:
-            pass
-        return rssi, lq
+            return None
+        return None
 
     def trigger_probe(self):
         """Асинхронный опрос спящего iPhone через D-Bus Connect (не блокирует главный цикл)"""
@@ -309,28 +330,42 @@ class ProximityDaemon:
         if self.last_connected:
             self.last_seen_time = now
             time_since_seen = 0.0
-            bt_rssi, lq = self.get_bt_stats()
-            self.last_bt_rssi = bt_rssi
-            self.last_link_quality = lq
+            hw_rssi = self.get_hardware_rssi()
 
-            lq_str = f"LQ: {lq}/255" if lq is not None else "100%"
-            rssi_str = f"RSSI: {bt_rssi}" if bt_rssi is not None else "--"
-            sig_info = f"{lq_str} | {rssi_str}"
+            if hw_rssi is not None:
+                # Экспоненциальное сглаживание для подавления радиошума
+                if self.smooth_rssi is None:
+                    self.smooth_rssi = float(hw_rssi)
+                else:
+                    self.smooth_rssi = 0.6 * hw_rssi + 0.4 * self.smooth_rssi
+                cur_rssi = int(round(self.smooth_rssi))
+                self.last_rssi = cur_rssi
 
-            if lq is not None and lq < 130:
-                is_far = True
-                status_desc = "СЛАБЫЙ СИГНАЛ (УДАЛЕНИЕ)"
+                sig_info = f"RSSI: {cur_rssi} dBm (raw: {hw_rssi})"
+                if cur_rssi < self.rssi_lock:
+                    is_far = True
+                    status_desc = "ОТОШЁЛ (ДАЛЕКО)"
+                elif cur_rssi >= self.rssi_unlock:
+                    is_close = True
+                    status_desc = "У СТОЛА (БЛИЗКО)"
+                else:
+                    status_desc = "СРЕДНЯЯ ЗОНА"
             else:
+                # Если дескриптор соединения еще инициализируется
                 is_close = True
                 status_desc = "ПОДКЛЮЧЕН (BT)"
+                sig_info = "Инициализация канала"
         else:
+            self.smooth_rssi = None
             # Не подключен: проверяем свежие BLE-пакеты (если экран iPhone активен)
             if time_since_seen <= self.away_timeout and self.last_ble_rssi is not None:
-                sig_info = f"RSSI: {self.last_ble_rssi} dBm"
-                if self.last_ble_rssi >= self.rssi_unlock:
+                cur_rssi = self.last_ble_rssi
+                self.last_rssi = cur_rssi
+                sig_info = f"BLE RSSI: {cur_rssi} dBm"
+                if cur_rssi >= self.rssi_unlock:
                     is_close = True
                     status_desc = "РЯДОМ (BLE)"
-                elif self.last_ble_rssi < self.rssi_lock:
+                elif cur_rssi < self.rssi_lock:
                     is_far = True
                     status_desc = "ДАЛЕКО (BLE)"
                 else:
@@ -506,33 +541,39 @@ def interactive_config():
     cfg["device_name"] = selected_name
 
     print("\n2. НАСТРОЙКА ДАЛЬНОСТИ СРАБАТЫВАНИЯ:")
-    print("  [1] Близко  (~1-1.5 м от ноутбука, блокировка при отходе от стола) [РЕКОМЕНДУЕТСЯ]")
-    print("  [2] Средне  (~2.5-3.5 м, в пределах одной комнаты)")
-    print("  [3] Далеко  (~5-7 м, блокировка при выходе из кабинета/квартиры)")
-    print("  [4] Ручная калибровка (ввести свои пороги RSSI)")
+    print("  [1] Очень близко (~1-1.5 м, блокировка сразу при отходе от стола) [РЕКОМЕНДУЕТСЯ]")
+    print("  [2] Близко       (~2-2.5 м, зона рабочего места)")
+    print("  [3] Средне       (~3.5-5 м, в пределах одной комнаты)")
+    print("  [4] Далеко       (~7-10 м, при выходе в соседнюю комнату)")
+    print("  [5] Ручная калибровка (ввести свои пороги RSSI)")
 
-    dist_choice = input("\nВыберите профиль [1-4] (по умолчанию 1): ").strip() or "1"
+    dist_choice = input("\nВыберите профиль [1-5] (по умолчанию 1): ").strip() or "1"
     if dist_choice == "1":
-        cfg["distance_profile"] = "near"
-        cfg["rssi_lock_threshold"] = -58
-        cfg["rssi_unlock_threshold"] = -52
-        cfg["away_timeout"] = 4.0
+        cfg["distance_profile"] = "very_near"
+        cfg["rssi_lock_threshold"] = -62
+        cfg["rssi_unlock_threshold"] = -55
+        cfg["away_timeout"] = 3.0
     elif dist_choice == "2":
-        cfg["distance_profile"] = "medium"
+        cfg["distance_profile"] = "near"
         cfg["rssi_lock_threshold"] = -68
         cfg["rssi_unlock_threshold"] = -60
-        cfg["away_timeout"] = 5.0
+        cfg["away_timeout"] = 4.0
     elif dist_choice == "3":
-        cfg["distance_profile"] = "far"
-        cfg["rssi_lock_threshold"] = -78
-        cfg["rssi_unlock_threshold"] = -70
-        cfg["away_timeout"] = 6.0
+        cfg["distance_profile"] = "medium"
+        cfg["rssi_lock_threshold"] = -76
+        cfg["rssi_unlock_threshold"] = -68
+        cfg["away_timeout"] = 5.0
     elif dist_choice == "4":
+        cfg["distance_profile"] = "far"
+        cfg["rssi_lock_threshold"] = -84
+        cfg["rssi_unlock_threshold"] = -76
+        cfg["away_timeout"] = 6.0
+    elif dist_choice == "5":
         cfg["distance_profile"] = "custom"
-        lock_val = input(f"Порог блокировки RSSI (в dBm, напр. -60) [{cfg['rssi_lock_threshold']}]: ").strip()
+        lock_val = input(f"Порог блокировки RSSI (в dBm, напр. -62) [{cfg.get('rssi_lock_threshold', -62)}]: ").strip()
         if lock_val:
             cfg["rssi_lock_threshold"] = int(lock_val)
-        unlock_val = input(f"Порог разблокировки RSSI (в dBm, напр. -52) [{cfg['rssi_unlock_threshold']}]: ").strip()
+        unlock_val = input(f"Порог разблокировки RSSI (в dBm, напр. -55) [{cfg.get('rssi_unlock_threshold', -55)}]: ").strip()
         if unlock_val:
             cfg["rssi_unlock_threshold"] = int(unlock_val)
 
