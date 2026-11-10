@@ -1,0 +1,11 @@
+{
+    "device_mac": "XX:XX:XX:XX:XX:XX",
+    "device_name": "My iPhone",
+    "distance_profile": "near",
+    "rssi_lock_threshold": -58,
+    "rssi_unlock_threshold": -52,
+    "away_timeout": 4.0,
+    "required_near_hits": 2,
+    "required_away_hits": 3,
+    "manual_lock_requires_password": true
+}

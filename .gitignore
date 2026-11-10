@@ -1,0 +1,18 @@
+# Personal config with MAC-address
+config.json
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary and log files
+*.log
+*.tmp
+*~
+.DS_Store
+
+# Editor directories
+.vscode/
+.idea/
+*.swp
