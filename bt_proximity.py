@@ -166,16 +166,21 @@ class ProximityDaemon:
         self.device_mac = cfg["device_mac"].upper()
         self.device_path = mac_to_path(self.device_mac)
         self.adapter_path = "/org/bluez/hci0"
-        self.rssi_lock = cfg["rssi_lock_threshold"]
-        self.rssi_unlock = cfg["rssi_unlock_threshold"]
-        self.away_timeout = cfg["away_timeout"]
-        self.req_near_hits = cfg.get("required_near_hits", 2)
-        self.req_away_hits = cfg.get("required_away_hits", 3)
+        self.rssi_lock = cfg.get("rssi_lock_threshold", -58)
+        self.rssi_unlock = cfg.get("rssi_unlock_threshold", -52)
+        self.away_timeout = float(cfg.get("away_timeout", 4.0))
+        self.req_near_hits = int(cfg.get("required_near_hits", 2))
+        self.req_away_hits = int(cfg.get("required_away_hits", 3))
         self.manual_lock_requires_pwd = cfg.get("manual_lock_requires_password", True)
 
         self.last_seen_time = time.time()
-        self.last_rssi = None
+        self.last_ble_rssi = None
+        self.last_bt_rssi = None
+        self.last_link_quality = None
         self.last_connected = False
+        self.probe_in_progress = False
+        self.last_probe_time = 0.0
+
         self.state = "unlocked"
         self.near_hits = 0
         self.away_hits = 0
@@ -189,6 +194,7 @@ class ProximityDaemon:
         self.adapter_obj = self.bus.get_object("org.bluez", self.adapter_path)
         self.device_obj = self.bus.get_object("org.bluez", self.device_path)
         self.adapter = dbus.Interface(self.adapter_obj, "org.bluez.Adapter1")
+        self.dev_iface = dbus.Interface(self.device_obj, "org.bluez.Device1")
 
     def is_screensaver_active(self):
         try:
@@ -211,7 +217,7 @@ class ProximityDaemon:
     def start_discovery(self):
         try:
             self.adapter.SetDiscoveryFilter({
-                "Transport": dbus.String("le"),
+                "Transport": dbus.String("auto"),
                 "DuplicateData": dbus.Boolean(True)
             })
             self.adapter.StartDiscovery()
@@ -223,9 +229,58 @@ class ProximityDaemon:
         if path == self.device_path:
             if "Connected" in changed_props:
                 self.last_connected = bool(changed_props["Connected"])
+                if self.last_connected:
+                    self.last_seen_time = time.time()
+                    self.away_hits = 0
             if "RSSI" in changed_props:
-                self.last_rssi = int(changed_props["RSSI"])
+                self.last_ble_rssi = int(changed_props["RSSI"])
                 self.last_seen_time = time.time()
+
+    def get_bt_stats(self):
+        """Чтение Link Quality и RSSI для активного Bluetooth Classic соединения"""
+        rssi = None
+        lq = None
+        try:
+            r = subprocess.run(["hcitool", "rssi", self.device_mac], capture_output=True, text=True, timeout=0.6)
+            if r.returncode == 0 and "RSSI return value:" in r.stdout:
+                rssi = int(r.stdout.strip().split()[-1])
+        except Exception:
+            pass
+        try:
+            r = subprocess.run(["hcitool", "lq", self.device_mac], capture_output=True, text=True, timeout=0.6)
+            if r.returncode == 0 and "Link quality:" in r.stdout:
+                lq = int(r.stdout.strip().split()[-1])
+        except Exception:
+            pass
+        return rssi, lq
+
+    def trigger_probe(self):
+        """Асинхронный опрос спящего iPhone через D-Bus Connect (не блокирует главный цикл)"""
+        if self.probe_in_progress or self.last_connected:
+            return
+        if time.time() - self.last_probe_time < 2.5:
+            return
+
+        self.probe_in_progress = True
+        self.last_probe_time = time.time()
+
+        def on_connect_success():
+            self.probe_in_progress = False
+            self.last_connected = True
+            self.last_seen_time = time.time()
+            self.away_hits = 0
+
+        def on_connect_error(err):
+            self.probe_in_progress = False
+
+        try:
+            self.dev_iface.Connect(
+                reply_handler=on_connect_success,
+                error_handler=on_connect_error,
+                timeout=2.5
+            )
+        except Exception:
+            self.probe_in_progress = False
 
     def check_tick(self):
         now = time.time()
@@ -238,22 +293,58 @@ class ProximityDaemon:
         except Exception:
             pass
 
-        # Читаем состояние устройства
+        # Читаем актуальное состояние подключения из BlueZ
         try:
             dev_props = dbus.Interface(self.device_obj, "org.freedesktop.DBus.Properties")
-            all_props = dev_props.GetAll("org.bluez.Device1")
-            self.last_connected = bool(all_props.get("Connected", 0))
-            cur_rssi = all_props.get("RSSI", None)
-            if cur_rssi is not None:
-                self.last_rssi = int(cur_rssi)
-                self.last_seen_time = now
+            self.last_connected = bool(dev_props.Get("org.bluez.Device1", "Connected"))
         except Exception:
-            pass
+            self.last_connected = False
 
         time_since_seen = now - self.last_seen_time
+        is_close = False
+        is_far = False
+        status_desc = ""
+        sig_info = ""
 
-        is_far = (time_since_seen > self.away_timeout) or (self.last_rssi is not None and self.last_rssi < self.rssi_lock)
-        is_close = (time_since_seen <= self.away_timeout) and (self.last_rssi is not None and self.last_rssi >= self.rssi_unlock)
+        if self.last_connected:
+            self.last_seen_time = now
+            time_since_seen = 0.0
+            bt_rssi, lq = self.get_bt_stats()
+            self.last_bt_rssi = bt_rssi
+            self.last_link_quality = lq
+
+            lq_str = f"LQ: {lq}/255" if lq is not None else "100%"
+            rssi_str = f"RSSI: {bt_rssi}" if bt_rssi is not None else "--"
+            sig_info = f"{lq_str} | {rssi_str}"
+
+            if lq is not None and lq < 130:
+                is_far = True
+                status_desc = "СЛАБЫЙ СИГНАЛ (УДАЛЕНИЕ)"
+            else:
+                is_close = True
+                status_desc = "ПОДКЛЮЧЕН (BT)"
+        else:
+            # Не подключен: проверяем свежие BLE-пакеты (если экран iPhone активен)
+            if time_since_seen <= self.away_timeout and self.last_ble_rssi is not None:
+                sig_info = f"RSSI: {self.last_ble_rssi} dBm"
+                if self.last_ble_rssi >= self.rssi_unlock:
+                    is_close = True
+                    status_desc = "РЯДОМ (BLE)"
+                elif self.last_ble_rssi < self.rssi_lock:
+                    is_far = True
+                    status_desc = "ДАЛЕКО (BLE)"
+                else:
+                    status_desc = "СРЕДНЯЯ ЗОНА (BLE)"
+            else:
+                # Нет свежих BLE-пакетов (черный экран iPhone в глубоком сне или отошёл)
+                self.trigger_probe()
+                if self.probe_in_progress:
+                    status_desc = "ОПРОС (Probe...)"
+                    sig_info = "Поиск спящего iPhone"
+                else:
+                    status_desc = "НЕТ СВЯЗИ"
+                    sig_info = "Вне зоны действия"
+                is_far = True
 
         if is_far:
             self.away_hits += 1
@@ -279,15 +370,7 @@ class ProximityDaemon:
                 self.locked_by_proximity = False
                 log(f"[{time.strftime('%H:%M:%S')}] [✓] Экран разблокирован паролем. Слежение снова активно.")
 
-        # Статус для вывода
-        if is_close:
-            zone = "У СТОЛА (БЛИЗКО)"
-        elif is_far:
-            zone = "ОТОШЁЛ (ДАЛЕКО)"
-        else:
-            zone = "СРЕДНЯЯ ЗОНА"
-
-        rssi_str = f"{self.last_rssi} dBm" if self.last_rssi is not None else "--"
+        # Статус для вывода в консоль / журнал
         if self.is_monitor_only:
             mode_prefix = "[MONITOR]"
         elif self.manual_lock_detected and self.manual_lock_requires_pwd:
@@ -296,14 +379,15 @@ class ProximityDaemon:
             mode_prefix = f"[{self.state.upper()}]"
 
         extra_info = " | ТРЕБУЕТСЯ ПАРОЛЬ" if (self.manual_lock_detected and self.manual_lock_requires_pwd) else ""
-        log(f"[{time.strftime('%H:%M:%S')}] {mode_prefix:<13} Зона: {zone:<17} | RSSI: {rssi_str:<8} | Молчит: {time_since_seen:.1f}с{extra_info}")
+        log(f"[{time.strftime('%H:%M:%S')}] {mode_prefix:<13} {status_desc:<24} | {sig_info:<22} | Молчит: {time_since_seen:.1f}с{extra_info}")
 
         if not self.is_monitor_only:
             session_id = get_current_session()
             if self.state == "unlocked":
                 if is_far and self.away_hits >= self.req_away_hits:
                     self.locked_by_proximity = True
-                    lock_screen(session_id, self.last_rssi)
+                    cur_val = self.last_ble_rssi or self.last_bt_rssi or "--"
+                    lock_screen(session_id, cur_val)
                     self.state = "locked"
             elif self.state == "locked":
                 # Если была ручная блокировка с кнопки и включена опция "требовать пароль"
@@ -311,7 +395,8 @@ class ProximityDaemon:
                     pass  # Ничего не делаем, ждем пока пользователь введет пароль руками
                 else:
                     if is_close and self.near_hits >= self.req_near_hits:
-                        unlock_screen(session_id, self.last_rssi)
+                        cur_val = self.last_ble_rssi or self.last_bt_rssi or "--"
+                        unlock_screen(session_id, cur_val)
                         self.state = "unlocked"
                         self.locked_by_proximity = False
                         self.manual_lock_detected = False
