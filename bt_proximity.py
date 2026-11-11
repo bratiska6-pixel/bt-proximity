@@ -716,7 +716,7 @@ def show_status():
 def main():
     parser = argparse.ArgumentParser(description="bt-proximity: Блокировка и разблокировка Linux по Bluetooth/BLE")
     parser.add_argument("command", nargs="?", default="run",
-                        choices=["run", "monitor", "test", "status", "config", "scan", "install", "uninstall"],
+                        choices=["run", "monitor", "test", "status", "config", "scan", "install", "uninstall", "start", "stop", "restart", "pause", "resume"],
                         help="Команда для выполнения")
 
     args = parser.parse_args()
@@ -734,6 +734,15 @@ def main():
         daemon.run()
     elif args.command == "status":
         show_status()
+    elif args.command in ["start", "resume"]:
+        subprocess.run(["systemctl", "--user", "start", SERVICE_NAME])
+        print("[✓] Служба bt-proximity запущена.")
+    elif args.command in ["stop", "pause"]:
+        subprocess.run(["systemctl", "--user", "stop", SERVICE_NAME])
+        print("[✓] Служба bt-proximity временно остановлена. Экран не будет блокироваться по Bluetooth.")
+    elif args.command == "restart":
+        subprocess.run(["systemctl", "--user", "restart", SERVICE_NAME])
+        print("[✓] Служба bt-proximity перезапущена.")
     elif args.command == "install":
         install_service()
     elif args.command == "uninstall":
