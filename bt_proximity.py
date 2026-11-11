@@ -300,9 +300,12 @@ class ProximityDaemon:
 
         self.last_seen_time = time.time()
         self.last_ble_rssi = None
+        self.last_ble_time = 0.0
         self.last_bt_rssi = None
         self.smooth_rssi = None
         self.last_connected = False
+        self.prev_connected = False
+        self.disconnect_time = 0.0
         self.probe_in_progress = False
         self.last_probe_time = 0.0
 
@@ -354,21 +357,29 @@ class ProximityDaemon:
         if path == self.device_path:
             debug_log(f"[DBUS] PropertiesChanged: {dict(changed_props)}")
             if "Connected" in changed_props:
-                self.last_connected = bool(changed_props["Connected"])
+                new_conn = bool(changed_props["Connected"])
+                if self.last_connected and not new_conn:
+                    self.disconnect_time = time.time()
+                    debug_log(f"[DBUS] Disconnected! Recorded disconnect_time={self.disconnect_time:.1f}")
+                self.last_connected = new_conn
                 if self.last_connected:
                     self.last_seen_time = time.time()
                     self.away_hits = 0
             if "RSSI" in changed_props:
                 self.last_ble_rssi = int(changed_props["RSSI"])
+                self.last_ble_time = time.time()
                 self.last_seen_time = time.time()
 
     def get_hardware_rssi(self):
-        """Чтение реального аппаратного RSSI активного соединения (LE или Classic) через HCI"""
+        """Чтение аппаратного RSSI активного соединения (LE или Classic) через HCI с пересчетом в dBm"""
         try:
             out = subprocess.check_output(["hcitool", "con"], text=True, stderr=subprocess.DEVNULL)
             handle = None
+            is_le = False
             for line in out.splitlines():
                 if self.device_mac.upper() in line.upper() and "handle" in line:
+                    if "LE" in line:
+                        is_le = True
                     parts = line.split()
                     if "handle" in parts:
                         idx = parts.index("handle")
@@ -391,8 +402,20 @@ class ProximityDaemon:
                     bytes_list = lines[i + 1].strip().split()
                     if len(bytes_list) >= 7 and bytes_list[3] == "00":
                         raw_rssi = struct.unpack("b", bytes.fromhex(bytes_list[6]))[0]
-                        debug_log(f"[HCI] Handle {handle}: raw RSSI = {raw_rssi} dBm")
-                        return raw_rssi
+                        if handle >= 2048 or is_le:
+                            # Для LE соединений raw_rssi это абсолютные dBm
+                            debug_log(f"[HCI] Handle {handle} (LE): raw RSSI = {raw_rssi} dBm")
+                            return raw_rssi
+                        else:
+                            # Для Classic BR/EDR соединений raw_rssi это смещение от Golden Range (-45..-60 dBm).
+                            # 0 = идеальная мощность у стола (~ -54 dBm).
+                            # Отрицательное смещение = удаление (каждый шаг ~ 3 dB).
+                            if raw_rssi <= 0:
+                                est_dbm = -54 + (raw_rssi * 3)
+                            else:
+                                est_dbm = min(-30, -54 + (raw_rssi * 3))
+                            debug_log(f"[HCI] Handle {handle} (Classic): GRPR offset={raw_rssi} -> est {est_dbm} dBm")
+                            return est_dbm
                     else:
                         debug_log(f"[HCI] Handle {handle}: status != 00 in HCI event: {lines[i + 1]}")
         except Exception as e:
@@ -404,7 +427,11 @@ class ProximityDaemon:
         """Асинхронный опрос спящего iPhone через D-Bus Connect (не блокирует главный цикл)"""
         if self.probe_in_progress or self.last_connected:
             return
-        if time.time() - self.last_probe_time < 2.5:
+
+        # Если экран уже заблокирован, опрашиваем в 3-4 раза реже (раз в 10 сек),
+        # чтобы не спамить драйвер BlueZ и не сажать батарею ноутбука
+        min_interval = 10.0 if self.state == "locked" else 3.0
+        if time.time() - self.last_probe_time < min_interval:
             return
 
         self.probe_in_progress = True
@@ -421,9 +448,9 @@ class ProximityDaemon:
         def on_connect_error(err):
             self.probe_in_progress = False
             err_str = str(err)
-            if "Operation already in progress" in err_str:
+            if any(k in err_str for k in ["Operation already in progress", "br-connection-busy", "InProgress", "NoReply"]):
                 self.last_probe_time = time.time() + 6.0
-                debug_log(f"[PROBE] Connect in progress in BlueZ, backoff 6s: {err}")
+                debug_log(f"[PROBE] BlueZ busy/timeout, backoff 6s: {err}")
             else:
                 debug_log(f"[PROBE] Connect FAILED: {err}")
 
@@ -436,7 +463,7 @@ class ProximityDaemon:
         except Exception as e:
             self.probe_in_progress = False
             err_str = str(e)
-            if "Operation already in progress" in err_str:
+            if any(k in err_str for k in ["Operation already in progress", "br-connection-busy", "InProgress", "NoReply"]):
                 self.last_probe_time = time.time() + 6.0
             debug_log(f"[PROBE] Failed to invoke Connect: {e}")
 
@@ -454,8 +481,14 @@ class ProximityDaemon:
         # Читаем актуальное состояние подключения из BlueZ
         try:
             dev_props = dbus.Interface(self.device_obj, "org.freedesktop.DBus.Properties")
-            self.last_connected = bool(dev_props.Get("org.bluez.Device1", "Connected"))
+            is_conn = bool(dev_props.Get("org.bluez.Device1", "Connected"))
+            if self.last_connected and not is_conn:
+                self.disconnect_time = now
+                debug_log(f"[TICK] Connection dropped! Recorded disconnect_time={now:.1f}")
+            self.last_connected = is_conn
         except Exception:
+            if self.last_connected:
+                self.disconnect_time = now
             self.last_connected = False
 
         time_since_seen = now - self.last_seen_time
@@ -466,16 +499,22 @@ class ProximityDaemon:
         hw_rssi = None
 
         if self.last_connected:
-            self.last_seen_time = now
-            time_since_seen = 0.0
             hw_rssi = self.get_hardware_rssi()
 
             if hw_rssi is not None:
+                self.last_seen_time = now
+                time_since_seen = 0.0
+
+                effective_rssi = hw_rssi
+                # Если за последние 3 секунды пришел свежий BLE-пакет, учитываем его:
+                if self.last_ble_time and (now - self.last_ble_time < 3.0) and self.last_ble_rssi is not None:
+                    effective_rssi = min(hw_rssi, self.last_ble_rssi)
+
                 # Экспоненциальное сглаживание для подавления радиошума
                 if self.smooth_rssi is None:
-                    self.smooth_rssi = float(hw_rssi)
+                    self.smooth_rssi = float(effective_rssi)
                 else:
-                    self.smooth_rssi = 0.6 * hw_rssi + 0.4 * self.smooth_rssi
+                    self.smooth_rssi = 0.6 * effective_rssi + 0.4 * self.smooth_rssi
                 cur_rssi = int(round(self.smooth_rssi))
                 self.last_rssi = cur_rssi
 
@@ -490,13 +529,12 @@ class ProximityDaemon:
                     status_desc = "СРЕДНЯЯ ЗОНА"
             else:
                 # Если дескриптор соединения еще инициализируется
-                is_close = True
-                status_desc = "ПОДКЛЮЧЕН (BT)"
-                sig_info = "Инициализация канала"
+                status_desc = "ИНИЦИАЛИЗАЦИЯ (BT)"
+                sig_info = "Ожидание канала..."
         else:
             self.smooth_rssi = None
             # Не подключен: проверяем свежие BLE-пакеты (если экран iPhone активен)
-            if time_since_seen <= self.away_timeout and self.last_ble_rssi is not None:
+            if (now - self.last_ble_time <= self.away_timeout) and self.last_ble_rssi is not None:
                 cur_rssi = self.last_ble_rssi
                 self.last_rssi = cur_rssi
                 sig_info = f"BLE RSSI: {cur_rssi} dBm"
@@ -511,13 +549,24 @@ class ProximityDaemon:
             else:
                 # Нет свежих BLE-пакетов (черный экран iPhone в глубоком сне или отошёл)
                 self.trigger_probe()
-                if self.probe_in_progress:
-                    status_desc = "ОПРОС (Probe...)"
-                    sig_info = "Поиск спящего iPhone"
+
+                # Льготный период (Grace Period) при внезапном разрыве пассивного Classic BT:
+                # Если перед разрывом сигнал был уверенным (>= -65 dBm) и прошло меньше 15 секунд:
+                time_since_dc = (now - self.disconnect_time) if self.disconnect_time > 0 else 999.0
+                was_close_before = (self.last_rssi is not None and self.last_rssi >= -65)
+
+                if was_close_before and (time_since_dc < 15.0):
+                    status_desc = "ПЕРЕПОДКЛЮЧЕНИЕ"
+                    sig_info = f"Пауза разрыва {time_since_dc:.1f}/15с"
+                    is_far = False
                 else:
-                    status_desc = "НЕТ СВЯЗИ"
-                    sig_info = "Вне зоны действия"
-                is_far = True
+                    if self.probe_in_progress:
+                        status_desc = "ОПРОС (Probe...)"
+                        sig_info = "Поиск спящего iPhone"
+                    else:
+                        status_desc = "НЕТ СВЯЗИ"
+                        sig_info = "Вне зоны действия"
+                    is_far = True
 
         if is_far:
             self.away_hits += 1
