@@ -8,6 +8,8 @@ import sys
 import time
 import json
 import struct
+import logging
+from logging.handlers import RotatingFileHandler
 import argparse
 import subprocess
 import dbus
@@ -17,6 +19,7 @@ from gi.repository import GLib
 APP_NAME = "bt-proximity"
 CONFIG_DIR = os.path.expanduser("~/.config/bt-proximity")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+DEBUG_LOG_FILE = os.path.join(CONFIG_DIR, "debug.log")
 SERVICE_NAME = "bt-proximity.service"
 USER_SYSTEMD_DIR = os.path.expanduser("~/.config/systemd/user")
 USER_SERVICE_PATH = os.path.join(USER_SYSTEMD_DIR, SERVICE_NAME)
@@ -30,7 +33,8 @@ DEFAULT_CONFIG = {
     "away_timeout": 3.5,
     "required_near_hits": 2,
     "required_away_hits": 3,
-    "manual_lock_requires_password": True
+    "manual_lock_requires_password": True,
+    "debug_logging": True
 }
 
 PROFILES = {
@@ -59,6 +63,102 @@ PROFILES = {
         "timeout": 6.0
     }
 }
+
+
+_debug_logger = None
+
+
+def setup_debug_logger(enabled=True):
+    """Инициализация подробного файлового логера с ротацией (до 10 МБ)"""
+    global _debug_logger
+    if not enabled:
+        _debug_logger = None
+        return None
+
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        logger = logging.getLogger("bt-proximity-debug")
+        logger.setLevel(logging.DEBUG)
+        logger.handlers.clear()
+
+        # Ротация: 10 МБ, максимум 1 резервная копия (файл никогда не переполнит диск)
+        handler = RotatingFileHandler(
+            DEBUG_LOG_FILE,
+            maxBytes=10 * 1024 * 1024,
+            backupCount=1,
+            encoding="utf-8"
+        )
+        formatter = logging.Formatter("[%(asctime)s.%(msecs)03d] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        _debug_logger = logger
+        return logger
+    except Exception as e:
+        print(f"[!] Не удалось инициализировать файл лога: {e}", flush=True)
+        return None
+
+
+def debug_log(msg):
+    """Запись строки в файл подробного лога, если логер активен"""
+    if _debug_logger is not None:
+        try:
+            _debug_logger.debug(msg)
+        except Exception:
+            pass
+
+
+def handle_log_command(action):
+    """Управление подробным логом: on, off, clear, show, status"""
+    cfg = load_config()
+    if action == "on":
+        cfg["debug_logging"] = True
+        save_config(cfg)
+        print(f"[✓] Подробный лог ВКЛЮЧЕН.")
+        print(f"    Файл: {DEBUG_LOG_FILE}")
+        print(f"    (Размер строго ограничен до 10 МБ с авто-ротацией, диск не переполнится)")
+        res = subprocess.run(["systemctl", "--user", "is-active", SERVICE_NAME], stdout=subprocess.PIPE, text=True)
+        if res.stdout.strip() == "active":
+            subprocess.run(["systemctl", "--user", "restart", SERVICE_NAME])
+            print("[✓] Служба bt-proximity перезапущена с подробным логированием.")
+    elif action == "off":
+        cfg["debug_logging"] = False
+        save_config(cfg)
+        print(f"[✓] Подробный лог ВЫКЛЮЧЕН.")
+        res = subprocess.run(["systemctl", "--user", "is-active", SERVICE_NAME], stdout=subprocess.PIPE, text=True)
+        if res.stdout.strip() == "active":
+            subprocess.run(["systemctl", "--user", "restart", SERVICE_NAME])
+            print("[✓] Служба bt-proximity перезапущена.")
+    elif action == "clear":
+        if os.path.exists(DEBUG_LOG_FILE):
+            try:
+                with open(DEBUG_LOG_FILE, "w", encoding="utf-8") as f:
+                    f.truncate(0)
+                print(f"[✓] Файл лога {DEBUG_LOG_FILE} успешно очищен.")
+            except Exception as e:
+                print(f"[!] Ошибка очистки лога: {e}")
+        else:
+            print("[i] Файл лога пока пуст или не создан.")
+    elif action in ["show", "view", "tail"]:
+        if os.path.exists(DEBUG_LOG_FILE):
+            print(f"--- Последние 40 строк из {DEBUG_LOG_FILE} ---")
+            try:
+                subprocess.run(["tail", "-n", "40", DEBUG_LOG_FILE])
+            except Exception:
+                pass
+        else:
+            print("[i] Файл лога пока пуст или не создан.")
+    else:  # status
+        status = "ВКЛЮЧЕН" if cfg.get("debug_logging", True) else "ВЫКЛЮЧЕН"
+        size = "0 КБ"
+        if os.path.exists(DEBUG_LOG_FILE):
+            size = f"{os.path.getsize(DEBUG_LOG_FILE) / 1024:.1f} КБ"
+        print(f"  Подробный лог: {status}")
+        print(f"  Файл:          {DEBUG_LOG_FILE} ({size})")
+        print("\n  Команды управления:")
+        print("    bt-proximity log on     - Включить подробный лог")
+        print("    bt-proximity log off    - Выключить подробный лог")
+        print("    bt-proximity log clear  - Очистить файл лога (освободить место)")
+        print("    bt-proximity log show   - Показать последние записи")
 
 
 def log(msg):
@@ -126,11 +226,13 @@ def wake_display():
 
 
 def lock_screen(session_id, rssi):
-    log(f"[{time.strftime('%H:%M:%S')}] >>> iPhone ДАЛЕКО (RSSI: {rssi} dBm). Блокировка экрана...")
+    msg = f"[{time.strftime('%H:%M:%S')}] >>> iPhone ДАЛЕКО (RSSI: {rssi} dBm). Блокировка экрана..."
+    log(msg)
+    debug_log(f"[ACTION] {msg} -> Calling loginctl lock-session and org.gnome.ScreenSaver.Lock")
     try:
         subprocess.run(["loginctl", "lock-session", session_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
+    except Exception as e:
+        debug_log(f"[ACTION] loginctl lock-session error: {e}")
     try:
         subprocess.run([
             "busctl", "--user", "call",
@@ -139,21 +241,23 @@ def lock_screen(session_id, rssi):
             "org.gnome.ScreenSaver",
             "Lock"
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
+    except Exception as e:
+        debug_log(f"[ACTION] ScreenSaver Lock error: {e}")
 
 
 def unlock_screen(session_id, rssi):
-    log(f"[{time.strftime('%H:%M:%S')}] >>> iPhone РЯДОМ (RSSI: {rssi} dBm). Разблокировка экрана...")
+    msg = f"[{time.strftime('%H:%M:%S')}] >>> iPhone РЯДОМ (RSSI: {rssi} dBm). Разблокировка экрана..."
+    log(msg)
+    debug_log(f"[ACTION] {msg} -> Calling wake_display, loginctl unlock-session, ScreenSaver.SetActive(false)")
     wake_display()
     try:
         subprocess.run(["loginctl", "activate", session_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
+    except Exception as e:
+        debug_log(f"[ACTION] loginctl activate error: {e}")
     try:
         subprocess.run(["loginctl", "unlock-session", session_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
+    except Exception as e:
+        debug_log(f"[ACTION] loginctl unlock-session error: {e}")
     try:
         subprocess.run([
             "busctl", "--user", "call",
@@ -162,8 +266,8 @@ def unlock_screen(session_id, rssi):
             "org.gnome.ScreenSaver",
             "SetActive", "b", "false"
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
+    except Exception as e:
+        debug_log(f"[ACTION] ScreenSaver SetActive(false) error: {e}")
 
 
 class ProximityDaemon:
@@ -173,11 +277,21 @@ class ProximityDaemon:
         self.device_mac = cfg["device_mac"].upper()
         self.device_path = mac_to_path(self.device_mac)
         self.adapter_path = "/org/bluez/hci0"
-        self.rssi_lock = cfg.get("rssi_lock_threshold", -58)
-        self.rssi_unlock = cfg.get("rssi_unlock_threshold", -52)
-        self.away_timeout = float(cfg.get("away_timeout", 4.0))
+        self.rssi_lock = cfg.get("rssi_lock_threshold", -62)
+        self.rssi_unlock = cfg.get("rssi_unlock_threshold", -55)
+        self.away_timeout = float(cfg.get("away_timeout", 3.5))
         self.req_near_hits = int(cfg.get("required_near_hits", 2))
         self.req_away_hits = int(cfg.get("required_away_hits", 3))
+        self.manual_lock_requires_pwd = cfg.get("manual_lock_requires_password", True)
+        self.debug_enabled = cfg.get("debug_logging", True)
+
+        setup_debug_logger(self.debug_enabled)
+        debug_log(
+            f"=== ProximityDaemon started === "
+            f"MAC: {self.device_mac}, profile: {self.cfg.get('distance_profile')}, "
+            f"lock: {self.rssi_lock} dBm, unlock: {self.rssi_unlock} dBm, "
+            f"timeout: {self.away_timeout}s, req_away: {self.req_away_hits}, req_near: {self.req_near_hits}"
+        )
         self.manual_lock_requires_pwd = cfg.get("manual_lock_requires_password", True)
 
         self.last_seen_time = time.time()
@@ -234,6 +348,7 @@ class ProximityDaemon:
 
     def on_property_changed(self, interface, changed_props, invalidated_props, path):
         if path == self.device_path:
+            debug_log(f"[DBUS] PropertiesChanged: {dict(changed_props)}")
             if "Connected" in changed_props:
                 self.last_connected = bool(changed_props["Connected"])
                 if self.last_connected:
@@ -256,6 +371,7 @@ class ProximityDaemon:
                         handle = int(parts[idx + 1])
                         break
             if handle is None:
+                debug_log(f"[HCI] No active connection handle in 'hcitool con' for {self.device_mac}")
                 return None
 
             h_low = f"0x{handle & 0xff:02x}"
@@ -270,8 +386,13 @@ class ProximityDaemon:
                 if "> HCI Event:" in l and i + 1 < len(lines):
                     bytes_list = lines[i + 1].strip().split()
                     if len(bytes_list) >= 7 and bytes_list[3] == "00":
-                        return struct.unpack("b", bytes.fromhex(bytes_list[6]))[0]
-        except Exception:
+                        raw_rssi = struct.unpack("b", bytes.fromhex(bytes_list[6]))[0]
+                        debug_log(f"[HCI] Handle {handle}: raw RSSI = {raw_rssi} dBm")
+                        return raw_rssi
+                    else:
+                        debug_log(f"[HCI] Handle {handle}: status != 00 in HCI event: {lines[i + 1]}")
+        except Exception as e:
+            debug_log(f"[HCI] Exception while reading RSSI: {e}")
             return None
         return None
 
@@ -284,15 +405,18 @@ class ProximityDaemon:
 
         self.probe_in_progress = True
         self.last_probe_time = time.time()
+        debug_log(f"[PROBE] Starting D-Bus Connect (timeout=2.5s) to {self.device_path}...")
 
         def on_connect_success():
             self.probe_in_progress = False
             self.last_connected = True
             self.last_seen_time = time.time()
             self.away_hits = 0
+            debug_log(f"[PROBE] Connect SUCCEEDED! Device responded.")
 
         def on_connect_error(err):
             self.probe_in_progress = False
+            debug_log(f"[PROBE] Connect FAILED: {err}")
 
         try:
             self.dev_iface.Connect(
@@ -300,8 +424,9 @@ class ProximityDaemon:
                 error_handler=on_connect_error,
                 timeout=2.5
             )
-        except Exception:
+        except Exception as e:
             self.probe_in_progress = False
+            debug_log(f"[PROBE] Failed to invoke Connect: {e}")
 
     def check_tick(self):
         now = time.time()
@@ -326,6 +451,7 @@ class ProximityDaemon:
         is_far = False
         status_desc = ""
         sig_info = ""
+        hw_rssi = None
 
         if self.last_connected:
             self.last_seen_time = now
@@ -398,12 +524,14 @@ class ProximityDaemon:
                 self.manual_lock_detected = True
                 self.state = "locked"
                 log(f"[{time.strftime('%H:%M:%S')}] [!] Зафиксирована ручная блокировка (Super+L/кнопка).")
+                debug_log("[LOCK] Manual lock (Super+L / menu) detected! Auto-unlock paused until password entered.")
         else:
             if self.manual_lock_detected or (self.state == "locked" and not self.locked_by_proximity):
                 self.manual_lock_detected = False
                 self.state = "unlocked"
                 self.locked_by_proximity = False
                 log(f"[{time.strftime('%H:%M:%S')}] [✓] Экран разблокирован паролем. Слежение снова активно.")
+                debug_log("[UNLOCK] Screen unlocked by password. Proximity tracking resumed.")
 
         # Статус для вывода в консоль / журнал
         if self.is_monitor_only:
@@ -416,12 +544,23 @@ class ProximityDaemon:
         extra_info = " | ТРЕБУЕТСЯ ПАРОЛЬ" if (self.manual_lock_detected and self.manual_lock_requires_pwd) else ""
         log(f"[{time.strftime('%H:%M:%S')}] {mode_prefix:<13} {status_desc:<24} | {sig_info:<22} | Молчит: {time_since_seen:.1f}с{extra_info}")
 
+        # Подробная запись в debug.log
+        debug_log(
+            f"[TICK] state={self.state:<8} | conn={int(self.last_connected)} | "
+            f"hw_rssi={str(hw_rssi):<4} | smooth={str(self.smooth_rssi):<5} | ble_rssi={str(self.last_ble_rssi):<4} | "
+            f"silent={time_since_seen:.1f}s | "
+            f"is_far={int(is_far)} (away={self.away_hits}/{self.req_away_hits}) | "
+            f"is_close={int(is_close)} (near={self.near_hits}/{self.req_near_hits}) | "
+            f"ss_active={int(screensaver_active)} | manual_lock={int(self.manual_lock_detected)}"
+        )
+
         if not self.is_monitor_only:
             session_id = get_current_session()
             if self.state == "unlocked":
                 if is_far and self.away_hits >= self.req_away_hits:
                     self.locked_by_proximity = True
-                    cur_val = self.last_ble_rssi or self.last_bt_rssi or "--"
+                    cur_val = (int(round(self.smooth_rssi)) if self.smooth_rssi is not None else None) or self.last_ble_rssi or "--"
+                    debug_log(f"[DECISION] Triggering LOCK: away_hits={self.away_hits}/{self.req_away_hits}, RSSI={cur_val}")
                     lock_screen(session_id, cur_val)
                     self.state = "locked"
             elif self.state == "locked":
@@ -430,11 +569,14 @@ class ProximityDaemon:
                     pass  # Ничего не делаем, ждем пока пользователь введет пароль руками
                 else:
                     if is_close and self.near_hits >= self.req_near_hits:
-                        cur_val = self.last_ble_rssi or self.last_bt_rssi or "--"
+                        cur_val = (int(round(self.smooth_rssi)) if self.smooth_rssi is not None else None) or self.last_ble_rssi or "--"
+                        debug_log(f"[DECISION] Triggering UNLOCK: near_hits={self.near_hits}/{self.req_near_hits}, RSSI={cur_val}")
                         unlock_screen(session_id, cur_val)
                         self.state = "unlocked"
                         self.locked_by_proximity = False
                         self.manual_lock_detected = False
+
+        return True
 
         return True
 
@@ -696,6 +838,11 @@ def show_status():
     print(f"  Таймаут отсутствия:      {cfg.get('away_timeout')} сек")
     pwd_req = "ДА (пароль обязателен)" if cfg.get("manual_lock_requires_password", True) else "НЕТ (телефон разблокирует)"
     print(f"  Блокировка с кнопки:     {pwd_req}")
+    dbg_stat = "ВКЛЮЧЕН" if cfg.get("debug_logging", True) else "ВЫКЛЮЧЕН"
+    size = "0 КБ"
+    if os.path.exists(DEBUG_LOG_FILE):
+        size = f"{os.path.getsize(DEBUG_LOG_FILE) / 1024:.1f} КБ"
+    print(f"  Подробный лог (debug):   {dbg_stat} ({size})")
     print("=" * 60)
 
     # Проверим, доступен ли телефон прямо сейчас
@@ -716,12 +863,16 @@ def show_status():
 def main():
     parser = argparse.ArgumentParser(description="bt-proximity: Блокировка и разблокировка Linux по Bluetooth/BLE")
     parser.add_argument("command", nargs="?", default="run",
-                        choices=["run", "monitor", "test", "status", "config", "scan", "install", "uninstall", "start", "stop", "restart", "pause", "resume"],
+                        choices=["run", "monitor", "test", "status", "config", "scan", "install", "uninstall", "start", "stop", "restart", "pause", "resume", "log", "debug-log"],
                         help="Команда для выполнения")
+    parser.add_argument("action", nargs="?", default="status",
+                        help="Действие для log (on, off, clear, show, status)")
 
     args = parser.parse_args()
 
-    if args.command == "config":
+    if args.command in ["log", "debug-log"]:
+        handle_log_command(args.action)
+    elif args.command == "config":
         interactive_config()
     elif args.command == "scan":
         devices = scan_devices()
