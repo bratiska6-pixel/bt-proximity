@@ -27,40 +27,44 @@ USER_SERVICE_PATH = os.path.join(USER_SYSTEMD_DIR, SERVICE_NAME)
 DEFAULT_CONFIG = {
     "device_mac": "",
     "device_name": "",
-    "distance_profile": "very_near",
-    "rssi_lock_threshold": -62,
-    "rssi_unlock_threshold": -55,
-    "away_timeout": 3.5,
+    "distance_profile": "near",
+    "rssi_lock_threshold": -68,
+    "rssi_unlock_threshold": -60,
+    "away_timeout": 5.0,
     "required_near_hits": 2,
-    "required_away_hits": 3,
+    "required_away_hits": 5,
     "manual_lock_requires_password": True,
     "debug_logging": True
 }
 
 PROFILES = {
-    "very_near": {
-        "name": "Очень близко (~1-1.5 м, сразу при отходе от стола)",
-        "lock": -62,
-        "unlock": -55,
-        "timeout": 3.0
-    },
     "near": {
-        "name": "Близко (~2-2.5 м, зона рабочего кабинета)",
+        "name": "Близко / Стол (~1.5-2 м, калибровано под рабочее место) [РЕКОМЕНДУЕТСЯ]",
         "lock": -68,
         "unlock": -60,
-        "timeout": 4.0
+        "timeout": 5.0,
+        "away_hits": 5
+    },
+    "very_near": {
+        "name": "Очень близко (~1 м, сразу при любом отдалении)",
+        "lock": -65,
+        "unlock": -58,
+        "timeout": 4.0,
+        "away_hits": 4
     },
     "medium": {
         "name": "Средне (~3.5-5 м, в пределах комнаты)",
         "lock": -76,
         "unlock": -68,
-        "timeout": 5.0
+        "timeout": 5.0,
+        "away_hits": 5
     },
     "far": {
         "name": "Далеко (~7-10 м, при выходе в другую комнату)",
         "lock": -84,
         "unlock": -76,
-        "timeout": 6.0
+        "timeout": 6.0,
+        "away_hits": 6
     }
 }
 
@@ -277,11 +281,11 @@ class ProximityDaemon:
         self.device_mac = cfg["device_mac"].upper()
         self.device_path = mac_to_path(self.device_mac)
         self.adapter_path = "/org/bluez/hci0"
-        self.rssi_lock = cfg.get("rssi_lock_threshold", -62)
-        self.rssi_unlock = cfg.get("rssi_unlock_threshold", -55)
-        self.away_timeout = float(cfg.get("away_timeout", 3.5))
+        self.rssi_lock = cfg.get("rssi_lock_threshold", -68)
+        self.rssi_unlock = cfg.get("rssi_unlock_threshold", -60)
+        self.away_timeout = float(cfg.get("away_timeout", 5.0))
         self.req_near_hits = int(cfg.get("required_near_hits", 2))
-        self.req_away_hits = int(cfg.get("required_away_hits", 3))
+        self.req_away_hits = int(cfg.get("required_away_hits", 5))
         self.manual_lock_requires_pwd = cfg.get("manual_lock_requires_password", True)
         self.debug_enabled = cfg.get("debug_logging", True)
 
@@ -416,7 +420,12 @@ class ProximityDaemon:
 
         def on_connect_error(err):
             self.probe_in_progress = False
-            debug_log(f"[PROBE] Connect FAILED: {err}")
+            err_str = str(err)
+            if "Operation already in progress" in err_str:
+                self.last_probe_time = time.time() + 6.0
+                debug_log(f"[PROBE] Connect in progress in BlueZ, backoff 6s: {err}")
+            else:
+                debug_log(f"[PROBE] Connect FAILED: {err}")
 
         try:
             self.dev_iface.Connect(
@@ -426,6 +435,9 @@ class ProximityDaemon:
             )
         except Exception as e:
             self.probe_in_progress = False
+            err_str = str(e)
+            if "Operation already in progress" in err_str:
+                self.last_probe_time = time.time() + 6.0
             debug_log(f"[PROBE] Failed to invoke Connect: {e}")
 
     def check_tick(self):
@@ -683,41 +695,48 @@ def interactive_config():
     cfg["device_name"] = selected_name
 
     print("\n2. НАСТРОЙКА ДАЛЬНОСТИ СРАБАТЫВАНИЯ:")
-    print("  [1] Очень близко (~1-1.5 м, блокировка сразу при отходе от стола) [РЕКОМЕНДУЕТСЯ]")
-    print("  [2] Близко       (~2-2.5 м, зона рабочего места)")
+    print("  [1] Близко / Стол (~1.5-2 м, зона рабочего места) [РЕКОМЕНДУЕТСЯ]")
+    print("  [2] Очень близко (~1 м, сразу при любом отдалении)")
     print("  [3] Средне       (~3.5-5 м, в пределах одной комнаты)")
     print("  [4] Далеко       (~7-10 м, при выходе в соседнюю комнату)")
     print("  [5] Ручная калибровка (ввести свои пороги RSSI)")
 
     dist_choice = input("\nВыберите профиль [1-5] (по умолчанию 1): ").strip() or "1"
     if dist_choice == "1":
-        cfg["distance_profile"] = "very_near"
-        cfg["rssi_lock_threshold"] = -62
-        cfg["rssi_unlock_threshold"] = -55
-        cfg["away_timeout"] = 3.0
-    elif dist_choice == "2":
         cfg["distance_profile"] = "near"
         cfg["rssi_lock_threshold"] = -68
         cfg["rssi_unlock_threshold"] = -60
+        cfg["away_timeout"] = 5.0
+        cfg["required_away_hits"] = 5
+    elif dist_choice == "2":
+        cfg["distance_profile"] = "very_near"
+        cfg["rssi_lock_threshold"] = -65
+        cfg["rssi_unlock_threshold"] = -58
         cfg["away_timeout"] = 4.0
+        cfg["required_away_hits"] = 4
     elif dist_choice == "3":
         cfg["distance_profile"] = "medium"
         cfg["rssi_lock_threshold"] = -76
         cfg["rssi_unlock_threshold"] = -68
         cfg["away_timeout"] = 5.0
+        cfg["required_away_hits"] = 5
     elif dist_choice == "4":
         cfg["distance_profile"] = "far"
         cfg["rssi_lock_threshold"] = -84
         cfg["rssi_unlock_threshold"] = -76
         cfg["away_timeout"] = 6.0
+        cfg["required_away_hits"] = 6
     elif dist_choice == "5":
         cfg["distance_profile"] = "custom"
-        lock_val = input(f"Порог блокировки RSSI (в dBm, напр. -62) [{cfg.get('rssi_lock_threshold', -62)}]: ").strip()
+        lock_val = input(f"Порог блокировки RSSI (в dBm, напр. -68) [{cfg.get('rssi_lock_threshold', -68)}]: ").strip()
         if lock_val:
             cfg["rssi_lock_threshold"] = int(lock_val)
-        unlock_val = input(f"Порог разблокировки RSSI (в dBm, напр. -55) [{cfg.get('rssi_unlock_threshold', -55)}]: ").strip()
+        unlock_val = input(f"Порог разблокировки RSSI (в dBm, напр. -60) [{cfg.get('rssi_unlock_threshold', -60)}]: ").strip()
         if unlock_val:
             cfg["rssi_unlock_threshold"] = int(unlock_val)
+        away_hits_val = input(f"Количество подтверждений ухода (секунд) [{cfg.get('required_away_hits', 5)}]: ").strip()
+        if away_hits_val:
+            cfg["required_away_hits"] = int(away_hits_val)
 
     print("\n3. ПОВЕДЕНИЕ ПРИ РУЧНОЙ БЛОКИРОВКЕ (Super+L / кнопка питания / меню):")
     print("  [1] Требовать пароль (телефон сам НЕ разблокирует при ручной блокировке) [РЕКОМЕНДУЕТСЯ]")
