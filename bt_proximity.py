@@ -12,6 +12,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import argparse
 import subprocess
+import traceback
 import dbus
 from dbus.mainloop.glib import DBusGMainLoop
 from gi.repository import GLib
@@ -299,6 +300,7 @@ class ProximityDaemon:
         self.manual_lock_requires_pwd = cfg.get("manual_lock_requires_password", True)
 
         self.last_seen_time = time.time()
+        self.last_rssi = None
         self.last_ble_rssi = None
         self.last_ble_time = 0.0
         self.last_bt_rssi = None
@@ -468,6 +470,14 @@ class ProximityDaemon:
             debug_log(f"[PROBE] Failed to invoke Connect: {e}")
 
     def check_tick(self):
+        try:
+            return self._do_check_tick()
+        except Exception as e:
+            debug_log(f"[FATAL_TICK_ERROR] Unhandled exception in check_tick: {e}\n{traceback.format_exc()}")
+            log(f"[!] Ошибка в check_tick: {e}")
+            return True
+
+    def _do_check_tick(self):
         now = time.time()
 
         # Следим, чтобы discovery не отключился
@@ -636,8 +646,6 @@ class ProximityDaemon:
                         self.state = "unlocked"
                         self.locked_by_proximity = False
                         self.manual_lock_detected = False
-
-        return True
 
         return True
 
