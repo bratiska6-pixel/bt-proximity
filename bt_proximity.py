@@ -560,14 +560,14 @@ class ProximityDaemon:
                 # Нет свежих BLE-пакетов (черный экран iPhone в глубоком сне или отошёл)
                 self.trigger_probe()
 
-                # Льготный период (Grace Period) при внезапном разрыве пассивного Classic BT:
-                # Если перед разрывом сигнал был уверенным (>= -65 dBm) и прошло меньше 15 секунд:
+                # Льготный период (Grace Period) при внезапном разрыве связи:
+                # Если перед разрывом сигнал был уверенным (>= -65 dBm), даем BlueZ до 4 сек на переподключение:
                 time_since_dc = (now - self.disconnect_time) if self.disconnect_time > 0 else 999.0
                 was_close_before = (self.last_rssi is not None and self.last_rssi >= -65)
 
-                if was_close_before and (time_since_dc < 15.0):
+                if was_close_before and (time_since_dc < 4.0):
                     status_desc = "ПЕРЕПОДКЛЮЧЕНИЕ"
-                    sig_info = f"Пауза разрыва {time_since_dc:.1f}/15с"
+                    sig_info = f"Пауза разрыва {time_since_dc:.1f}/4с"
                     is_far = False
                 else:
                     if self.probe_in_progress:
