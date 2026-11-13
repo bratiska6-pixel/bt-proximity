@@ -300,6 +300,7 @@ class ProximityDaemon:
         self.manual_lock_requires_pwd = cfg.get("manual_lock_requires_password", True)
 
         self.last_seen_time = time.time()
+        self.last_tick_time = time.time()
         self.last_rssi = None
         self.last_ble_rssi = None
         self.last_ble_time = 0.0
@@ -450,9 +451,19 @@ class ProximityDaemon:
         def on_connect_error(err):
             self.probe_in_progress = False
             err_str = str(err)
-            if any(k in err_str for k in ["Operation already in progress", "br-connection-busy", "InProgress", "NoReply"]):
-                self.last_probe_time = time.time() + 6.0
-                debug_log(f"[PROBE] BlueZ busy/timeout, backoff 6s: {err}")
+            if any(k in err_str for k in ["Operation already in progress", "br-connection-busy", "InProgress", "br-connection-aborted-by-local"]):
+                debug_log(f"[PROBE] BlueZ busy state ({err}). Calling Disconnect to reset state machine...")
+                try:
+                    self.dev_iface.Disconnect(
+                        reply_handler=lambda: debug_log("[PROBE] Reset Disconnect succeeded"),
+                        error_handler=lambda e: debug_log(f"[PROBE] Reset Disconnect note: {e}")
+                    )
+                except Exception as ex:
+                    debug_log(f"[PROBE] Reset Disconnect exception: {ex}")
+                self.last_probe_time = time.time() + 2.0
+            elif "NoReply" in err_str:
+                self.last_probe_time = time.time() + 4.0
+                debug_log(f"[PROBE] BlueZ timeout (NoReply), backoff 4s: {err}")
             else:
                 debug_log(f"[PROBE] Connect FAILED: {err}")
 
@@ -465,8 +476,18 @@ class ProximityDaemon:
         except Exception as e:
             self.probe_in_progress = False
             err_str = str(e)
-            if any(k in err_str for k in ["Operation already in progress", "br-connection-busy", "InProgress", "NoReply"]):
-                self.last_probe_time = time.time() + 6.0
+            if any(k in err_str for k in ["Operation already in progress", "br-connection-busy", "InProgress", "br-connection-aborted-by-local"]):
+                debug_log(f"[PROBE] BlueZ busy on call ({e}). Calling Disconnect to reset...")
+                try:
+                    self.dev_iface.Disconnect(
+                        reply_handler=lambda: debug_log("[PROBE] Reset Disconnect succeeded"),
+                        error_handler=lambda err: debug_log(f"[PROBE] Reset Disconnect note: {err}")
+                    )
+                except Exception:
+                    pass
+                self.last_probe_time = time.time() + 2.0
+            else:
+                self.last_probe_time = time.time() + 4.0
             debug_log(f"[PROBE] Failed to invoke Connect: {e}")
 
     def check_tick(self):
@@ -479,6 +500,25 @@ class ProximityDaemon:
 
     def _do_check_tick(self):
         now = time.time()
+
+        # Детектирование выхода из сна (suspend/resume) или задержки главного цикла
+        if self.last_tick_time and (now - self.last_tick_time > 4.0):
+            elapsed_sleep = now - self.last_tick_time
+            debug_log(f"[SYSTEM] Detected wake from sleep / system freeze ({elapsed_sleep:.1f}s gap). Resetting states...")
+            self.away_hits = 0
+            self.near_hits = 0
+            self.smooth_rssi = None
+            self.disconnect_time = now
+            self.last_probe_time = 0.0
+            self.probe_in_progress = False
+            try:
+                self.dev_iface.Disconnect(
+                    reply_handler=lambda: debug_log("[SYSTEM] Suspend recovery Disconnect done"),
+                    error_handler=lambda e: debug_log(f"[SYSTEM] Suspend recovery Disconnect note: {e}")
+                )
+            except Exception:
+                pass
+        self.last_tick_time = now
 
         # Следим, чтобы discovery не отключился
         try:
@@ -543,8 +583,14 @@ class ProximityDaemon:
                 sig_info = "Ожидание канала..."
         else:
             self.smooth_rssi = None
-            # Не подключен: проверяем свежие BLE-пакеты (если экран iPhone активен)
-            if (now - self.last_ble_time <= self.away_timeout) and self.last_ble_rssi is not None:
+            # Для спящего на столе iPhone (сигнал был уверенным >= -65 дБм)
+            # делаем таймаут тишины BLE более терпимым (до 9 сек),
+            # так как iOS в покое увеличивает интервал между широковещательными пакетами
+            was_close_recently = (self.last_rssi is not None and self.last_rssi >= -65)
+            effective_ble_timeout = max(self.away_timeout, 9.0) if was_close_recently else self.away_timeout
+
+            # Не подключен: проверяем свежие BLE-пакеты (если экран iPhone активен или маяки в эфире)
+            if (now - self.last_ble_time <= effective_ble_timeout) and self.last_ble_rssi is not None:
                 cur_rssi = self.last_ble_rssi
                 self.last_rssi = cur_rssi
                 sig_info = f"BLE RSSI: {cur_rssi} dBm"
@@ -561,13 +607,12 @@ class ProximityDaemon:
                 self.trigger_probe()
 
                 # Льготный период (Grace Period) при внезапном разрыве связи:
-                # Если перед разрывом сигнал был уверенным (>= -65 dBm), даем BlueZ до 4 сек на переподключение:
+                # Если перед разрывом сигнал был уверенным (>= -65 dBm), даем BlueZ до 5 сек на переподключение:
                 time_since_dc = (now - self.disconnect_time) if self.disconnect_time > 0 else 999.0
-                was_close_before = (self.last_rssi is not None and self.last_rssi >= -65)
 
-                if was_close_before and (time_since_dc < 4.0):
+                if was_close_recently and (time_since_dc < 5.0):
                     status_desc = "ПЕРЕПОДКЛЮЧЕНИЕ"
-                    sig_info = f"Пауза разрыва {time_since_dc:.1f}/4с"
+                    sig_info = f"Пауза разрыва {time_since_dc:.1f}/5с"
                     is_far = False
                 else:
                     if self.probe_in_progress:
